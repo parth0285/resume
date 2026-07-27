@@ -1,0 +1,327 @@
+import os
+import tempfile
+import time
+import streamlit as st
+from dotenv import load_dotenv
+
+import config
+from analyzer_engine import ResumeAnalyzerEngine
+from export_utils import (
+    master_records_to_dataframe,
+    publication_records_to_dataframe,
+    build_excel_workbook,
+    build_single_sheet_workbook,
+)
+
+# Load environment variables
+load_dotenv()
+
+# Set page config for a clean SaaS look
+st.set_page_config(
+    page_title="Resume Extraction Engine",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Remove the sidebar toggle button via CSS for a cleaner look
+st.markdown("""
+    <style>
+        [data-testid="collapsedControl"] { display: none; }
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🎓 Resume Extraction Engine")
+st.markdown("Automated, structured data extraction for faculty resumes and academic CVs.")
+st.markdown("---")
+
+# Initialize the modular analysis engine
+@st.cache_resource
+def get_engine():
+    return ResumeAnalyzerEngine()
+
+engine = get_engine()
+
+# Initialize session state for persistent results
+if "master_records" not in st.session_state:
+    st.session_state.master_records = []
+if "publication_records" not in st.session_state:
+    st.session_state.publication_records = []
+if "extraction_errors" not in st.session_state:
+    st.session_state.extraction_errors = []
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = []
+if "extraction_running" not in st.session_state:
+    st.session_state.extraction_running = False
+if "stop_requested" not in st.session_state:
+    st.session_state.stop_requested = False
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "google/gemini-3.5-flash-lite"
+
+# --- STEP 1: Model Selection ---
+st.markdown("### Step 1: Select AI Model")
+
+model_options = [
+    "Gemini 3.5 Flash (20 resumes/day)",
+    "Gemini 3.6 Flash (20 resumes/day)",
+    "Gemini 3.5 Flash Lite (500 resumes/day)",
+    "Gemini 3.1 Flash Lite (500 resumes/day)",
+]
+
+model_values = {
+    "Gemini 3.5 Flash (20 resumes/day)": "google/gemini-3.5-flash",
+    "Gemini 3.6 Flash (20 resumes/day)": "google/gemini-3.6-flash",
+    "Gemini 3.5 Flash Lite (500 resumes/day)": "google/gemini-3.5-flash-lite",
+    "Gemini 3.1 Flash Lite (500 resumes/day)": "google/gemini-3.1-flash-lite",
+}
+
+default_model = "google/gemini-3.5-flash-lite"
+
+default_display = next((label for label, model in model_values.items() if model == default_model), model_options[0])
+
+if st.session_state.selected_model not in model_values.values():
+    st.session_state.selected_model = default_model
+
+selected_display = st.selectbox(
+    "Model",
+    options=model_options,
+    index=model_options.index(next(label for label, model in model_values.items() if model == st.session_state.selected_model)),
+    label_visibility="collapsed"
+)
+selected_model = model_values[selected_display]
+st.session_state.selected_model = selected_model
+
+# Ensure Google Studio key exists
+if not os.getenv("GOOGLE_STUDIO_API_KEY"):
+    st.error("Missing GOOGLE_STUDIO_API_KEY in .env file.")
+    st.stop()
+
+
+# --- STEP 2: Upload Section ---
+st.markdown("### Step 2: Upload CVs")
+max_files = 20
+
+uploaded_files = st.file_uploader(
+    "Upload CVs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    label_visibility="collapsed"
+)
+
+# Enforce limits
+over_limit = False
+if uploaded_files and len(uploaded_files) > max_files:
+    over_limit = True
+    st.error(f"Remove {len(uploaded_files) - max_files} files to continue — limit is {max_files} per Google Studio model.")
+
+btn_disabled = not uploaded_files or over_limit
+
+extract_btn = st.button("Extract Data", disabled=btn_disabled, type="primary")
+
+# Triggering extraction
+if extract_btn and uploaded_files and not over_limit:
+    # Mark extraction as running and clear any previous stop flag
+    st.session_state.extraction_running = True
+    st.session_state.stop_requested = False
+    new_master_records = st.session_state.master_records.copy()
+    new_publication_records = st.session_state.publication_records.copy()
+    new_errors = []
+    failed_files = set()
+    new_processed = st.session_state.processed_files.copy()
+
+    progress = st.progress(0.0, text="Starting extraction...")
+    total = len(uploaded_files)
+
+    # Stop button — visible only while extraction is running
+    stop_col1, stop_col2 = st.columns([1, 3])
+    with stop_col1:
+        if st.button("⏹️ Stop Extraction"):
+            st.session_state.stop_requested = True
+    with stop_col2:
+        st.write("")
+
+    for idx, uploaded_file in enumerate(uploaded_files, start=1):
+        # If user requested stop before starting this iteration, break.
+        if st.session_state.stop_requested:
+            progress.progress((idx - 1) / total, text=f"Stopping after {idx-1} of {total} files...")
+            break
+        if uploaded_file.name in new_processed:
+            continue
+
+        progress.progress((idx - 1) / total, text=f"Processing {uploaded_file.name} ({idx}/{total})...")
+        tmp_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                tmp_path = tmp.name
+
+            def _update_progress(msg):
+                progress.progress(
+                    (idx - 1) / total,
+                    text=f"{uploaded_file.name} ({idx}/{total}): {msg}"
+                )
+
+            resume_text = engine.extract_text_from_pdf(tmp_path, progress_callback=_update_progress)
+
+            if not resume_text.strip():
+                new_errors.append(f"'{uploaded_file.name}': could not extract any readable text.")
+                continue
+
+            attempt = 1
+            while attempt <= 2:
+                progress.progress(
+                    (idx - 1) / total,
+                    text=f"Processing {uploaded_file.name} ({idx}/{total})... attempt {attempt}"
+                )
+
+                result = engine.extract_faculty_data(resume_text, uploaded_file.name, model_name=st.session_state.selected_model)
+                if "error" not in result:
+                    new_master_records.extend(result.get("master_faculty_database", []))
+                    new_publication_records.extend(result.get("publication_details", []))
+                    new_processed.append(uploaded_file.name)
+                    break
+
+                error_message = result["error"]
+                # Avoid appending duplicate errors for the same file
+                if uploaded_file.name in failed_files:
+                    break
+                is_rpm_error = "rate limit" in error_message.lower() or "requests per minute" in error_message.lower()
+                if attempt == 1 and is_rpm_error:
+                    progress.progress(
+                        (idx - 1) / total,
+                        text=f"Processing {uploaded_file.name} ({idx}/{total})... rate limit hit, retrying in 15s"
+                    )
+                    # Sleep conservatively based on the chosen model's RPM
+                    wait_s = engine.get_model_wait_seconds(st.session_state.selected_model)
+                    time.sleep(wait_s)
+                    attempt += 1
+                    continue
+
+                # Append the error only once per file
+                if uploaded_file.name not in failed_files:
+                    new_errors.append(error_message)
+                    failed_files.add(uploaded_file.name)
+                break
+
+            if idx < total:
+                progress.progress(
+                    (idx - 1) / total,
+                    text=f"Processing {uploaded_file.name} ({idx}/{total})... waiting for rate limit"
+                )
+                # Inter-file pacing according to selected model's RPM; silent to UI
+                time.sleep(engine.get_model_wait_seconds(st.session_state.selected_model))
+
+        except Exception as e:
+            # Avoid duplicate error messages for the same file
+            msg = f"'{uploaded_file.name}': unexpected error: {str(e)}"
+            if uploaded_file.name not in failed_files:
+                new_errors.append(msg)
+                failed_files.add(uploaded_file.name)
+
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    progress.progress(1.0, text="Extraction complete.")
+    if st.session_state.stop_requested:
+        progress.progress(1.0, text=f"Extraction stopped by user. {len(new_processed)} of {total} files processed.")
+    st.session_state.extraction_running = False
+    progress.empty()
+
+    st.session_state.master_records = new_master_records
+    st.session_state.publication_records = new_publication_records
+    st.session_state.extraction_errors = new_errors
+    st.session_state.processed_files = new_processed
+    
+    st.rerun()
+
+
+# --- STEP 3: Extraction Results ---
+if st.session_state.master_records or st.session_state.publication_records or st.session_state.extraction_errors:
+    st.markdown("---")
+    st.markdown("### Step 3: Extraction Results")
+
+    master_df = master_records_to_dataframe(st.session_state.master_records)
+    publication_df = publication_records_to_dataframe(st.session_state.publication_records)
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    with m_col1:
+        st.metric("Faculty Records", len(master_df))
+    with m_col2:
+        st.metric("Publications Extracted", len(publication_df))
+    with m_col3:
+        st.metric("Files Processed", len(st.session_state.processed_files))
+        
+    # Show successfully processed files
+    if st.session_state.processed_files:
+        with st.expander("✅ View Processed Files", expanded=False):
+            for f in st.session_state.processed_files:
+                st.markdown(f"- {f}")
+
+    # Show errors, if any
+    if st.session_state.extraction_errors:
+        with st.expander(f"⚠️ {len(st.session_state.extraction_errors)} File(s) Failed", expanded=True):
+            for err in st.session_state.extraction_errors:
+                st.error(err)
+
+    tab1, tab2 = st.tabs(["Master Faculty Database", "Publication Details"])
+
+    with tab1:
+        st.dataframe(master_df, use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.dataframe(publication_df, use_container_width=True, hide_index=True)
+
+
+    # --- STEP 4: Download Options ---
+    st.markdown("---")
+    st.markdown("### Step 4: Download & Export")
+    
+    d_col1, d_col2, d_col3, d_col4 = st.columns([1, 1, 1, 1])
+    
+    with d_col1:
+        master_bytes = build_single_sheet_workbook(master_df, "Master Faculty Database")
+        st.download_button(
+            label="📥 Master Sheet",
+            data=master_bytes,
+            file_name="master_faculty_database.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        
+    with d_col2:
+        pub_bytes = build_single_sheet_workbook(publication_df, "Publication Details")
+        st.download_button(
+            label="📥 Publication Sheet",
+            data=pub_bytes,
+            file_name="publication_details.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        
+    with d_col3:
+        combined_bytes = build_excel_workbook(master_df, publication_df)
+        st.download_button(
+            label="📥 Combined Workbook",
+            data=combined_bytes,
+            file_name="faculty_extraction_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        
+    with d_col4:
+        if st.button("🗑️ Clear Results", use_container_width=True):
+            st.session_state.master_records = []
+            st.session_state.publication_records = []
+            st.session_state.extraction_errors = []
+            st.session_state.processed_files = []
+            st.rerun()
