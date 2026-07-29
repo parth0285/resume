@@ -2,3 +2,4 @@
 __pycache__/
 uploaded_resume.pdf
 debug_logs/
+.env
