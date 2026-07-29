@@ -11,6 +11,8 @@ from export_utils import (
     publication_records_to_dataframe,
     build_excel_workbook,
     build_single_sheet_workbook,
+    build_publication_sheet_grouped,
+    build_publication_workbook_per_faculty,
 )
 
 # Load environment variables
@@ -23,22 +25,150 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Remove the sidebar toggle button via CSS for a cleaner look
+# --- Minimal theme (Google Fonts + custom CSS) ---
 st.markdown("""
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         [data-testid="collapsedControl"] { display: none; }
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
+        header[data-testid="stHeader"] { background: transparent; }
+
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
         .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
+            padding-top: 2.5rem;
+            padding-bottom: 3rem;
+            max-width: 1200px;
         }
+
+        :root {
+            --accent: #7C5CFC;
+            --grad: linear-gradient(90deg, #7C5CFC 0%, #C05CDB 100%);
+        }
+
+        /* Header */
+        .app-title {
+            font-weight: 700;
+            font-size: 2rem;
+            color: #14121F;
+            margin-bottom: 0.15rem;
+        }
+        .app-title .accent { color: var(--accent); }
+        .app-sub {
+            color: #6B7280;
+            font-size: 1.05rem;
+            margin-bottom: 1.8rem;
+        }
+
+        /* Step track — minimal text row */
+        .step-track {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.85rem;
+            color: #9691A8;
+            margin-bottom: 1.8rem;
+            flex-wrap: wrap;
+        }
+        .step-track .step { display: flex; align-items: center; gap: 0.35rem; }
+        .step-track .step.active { color: #14121F; font-weight: 600; }
+        .step-track .num {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #EFEBFE;
+            color: var(--accent);
+            font-size: 0.7rem;
+            font-weight: 600;
+        }
+        .step-track .step.active .num { background: var(--accent); color: white; }
+        .step-track .sep { color: #D9D5E8; }
+
+        /* Section headers */
+        .section-head {
+            font-weight: 600;
+            font-size: 1rem;
+            color: #14121F;
+            margin-top: 0.3rem;
+            margin-bottom: 0.15rem;
+        }
+        .section-sub {
+            color: #8A8698;
+            font-size: 0.85rem;
+            margin-bottom: 0.6rem;
+        }
+
+        /* Primary buttons -> flat gradient, no heavy shadow */
+        .stButton > button[kind="primary"], .stDownloadButton > button {
+            background: var(--grad) !important;
+            border: none !important;
+            color: white !important;
+            font-weight: 600 !important;
+            border-radius: 8px !important;
+            box-shadow: none !important;
+        }
+        .stButton > button[kind="primary"]:hover, .stDownloadButton > button:hover {
+            filter: brightness(1.05);
+            color: white !important;
+        }
+
+        /* File uploader -> subtle dashed drop zone */
+        /* Empty-state placeholder */
+        .empty-state {
+            border: 1.5px dashed #E5E2F0;
+            border-radius: 10px;
+            padding: 2.4rem 1.5rem;
+            text-align: center;
+            color: #9691A8;
+            margin-top: 1.6rem;
+        }
+        .empty-state .icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+        .empty-state .title { font-weight: 600; color: #57536A; font-size: 0.95rem; margin-bottom: 0.2rem; }
+        .empty-state .sub { font-size: 0.85rem; }
+
+        [data-testid="stFileUploaderDropzone"] {
+            background: #FAFAFC !important;
+            border: 1.5px dashed #DCD8EC !important;
+            border-radius: 10px !important;
+        }
+
+        hr { border-color: #EEECF5 !important; margin: 1.2rem 0 !important; }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🎓 Resume Extraction Engine")
-st.markdown("Automated, structured data extraction for faculty resumes and academic CVs.")
-st.markdown("---")
+
+def step_header(title: str, subtitle: str = ""):
+    st.markdown(f'<div class="section-head">{title}</div>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f'<div class="section-sub">{subtitle}</div>', unsafe_allow_html=True)
+
+
+# --- Header ---
+st.markdown('<div class="app-title">🎓 Resume <span class="accent">Extraction</span> Engine</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="app-sub">Automated, structured data extraction for faculty resumes and academic CVs.</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="step-track">
+        <div class="step active"><span class="num">1</span>Select Model</div>
+        <span class="sep">→</span>
+        <div class="step"><span class="num">2</span>Upload CVs</div>
+        <span class="sep">→</span>
+        <div class="step"><span class="num">3</span>Review</div>
+        <span class="sep">→</span>
+        <div class="step"><span class="num">4</span>Export</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Initialize the modular analysis engine
 @st.cache_resource
@@ -64,7 +194,7 @@ if "selected_model" not in st.session_state:
     st.session_state.selected_model = "google/gemini-3.5-flash-lite"
 
 # --- STEP 1: Model Selection ---
-st.markdown("### Step 1: Select AI Model")
+step_header("Select AI Model")
 
 model_options = [
     "Gemini 3.5 Flash (20 resumes/day)",
@@ -103,14 +233,15 @@ if not os.getenv("GOOGLE_STUDIO_API_KEY"):
 
 
 # --- STEP 2: Upload Section ---
-st.markdown("### Step 2: Upload CVs")
+step_header("Upload CVs", "Upload PDF or DOCX resumes for structured extraction.")
 max_files = 20
 
 uploaded_files = st.file_uploader(
     "Upload CVs",
-    type=["pdf"],
+    type=["pdf", "docx"],
     accept_multiple_files=True,
-    label_visibility="collapsed"
+    label_visibility="collapsed",
+    help="Upload up to 20 resumes in PDF or DOCX format."
 )
 
 # Enforce limits
@@ -157,7 +288,23 @@ if extract_btn and uploaded_files and not over_limit:
         tmp_path = None
 
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            file_name = uploaded_file.name
+            _, file_ext = os.path.splitext(file_name)
+            file_ext = file_ext.lower()
+
+            if file_ext == ".doc":
+                new_errors.append(
+                    f"'{file_name}': Old .doc format isn't supported — please save this file as .docx or PDF and re-upload."
+                )
+                continue
+            if file_ext not in {".pdf", ".docx"}:
+                new_errors.append(
+                    f"'{file_name}': Unsupported file type '{file_ext}'. Please upload PDF or DOCX files."
+                )
+                continue
+
+            suffix = file_ext
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(uploaded_file.getbuffer())
                 tmp_path = tmp.name
 
@@ -167,7 +314,10 @@ if extract_btn and uploaded_files and not over_limit:
                     text=f"{uploaded_file.name} ({idx}/{total}): {msg}"
                 )
 
-            resume_text = engine.extract_text_from_pdf(tmp_path, progress_callback=_update_progress)
+            if file_ext == ".pdf":
+                resume_text = engine.extract_text_from_pdf(tmp_path, progress_callback=_update_progress)
+            else:
+                resume_text = engine.extract_text_from_docx(tmp_path, progress_callback=_update_progress)
 
             if not resume_text.strip():
                 new_errors.append(f"'{uploaded_file.name}': could not extract any readable text.")
@@ -248,7 +398,7 @@ if extract_btn and uploaded_files and not over_limit:
 # --- STEP 3: Extraction Results ---
 if st.session_state.master_records or st.session_state.publication_records or st.session_state.extraction_errors:
     st.markdown("---")
-    st.markdown("### Step 3: Extraction Results")
+    step_header("Extraction Results")
 
     master_df = master_records_to_dataframe(st.session_state.master_records)
     publication_df = publication_records_to_dataframe(st.session_state.publication_records)
@@ -284,7 +434,7 @@ if st.session_state.master_records or st.session_state.publication_records or st
 
     # --- STEP 4: Download Options ---
     st.markdown("---")
-    st.markdown("### Step 4: Download & Export")
+    step_header("Download & Export")
     
     d_col1, d_col2, d_col3, d_col4 = st.columns([1, 1, 1, 1])
     
@@ -299,7 +449,7 @@ if st.session_state.master_records or st.session_state.publication_records or st
         )
         
     with d_col2:
-        pub_bytes = build_single_sheet_workbook(publication_df, "Publication Details")
+        pub_bytes = build_publication_workbook_per_faculty(master_df, publication_df)
         st.download_button(
             label="📥 Publication Sheet",
             data=pub_bytes,
@@ -325,3 +475,14 @@ if st.session_state.master_records or st.session_state.publication_records or st
             st.session_state.extraction_errors = []
             st.session_state.processed_files = []
             st.rerun()
+else:
+    st.markdown(
+        """
+        <div class="empty-state">
+            <div class="icon">📄</div>
+            <div class="title">No results yet</div>
+            <div class="sub">Upload resumes above and click "Extract Data" — your extracted faculty &amp; publication data will appear here.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )

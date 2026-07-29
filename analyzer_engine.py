@@ -10,6 +10,7 @@ import pdfplumber
 import pytesseract
 from PIL import Image
 from pdf2image import convert_from_path
+import docx
 import config
 from experience_calculator import safe_process_record, dedupe_publications, renumber_publications
 
@@ -185,8 +186,8 @@ GENERAL EXTRACTION RULES
 11. Preserve publication titles exactly.
 12. If publication numbering exists, use it.
 13. Otherwise generate sequential numbering.
-14. Extract all emails.
-15. Extract all phone numbers.
+14. Extract all emails belonging to the CV OWNER only. Many CVs include a "References," "Referees," or similar section near the end listing OTHER people (e.g., supervisors, colleagues, department heads) along with their own emails and phone numbers as character references. These belong to the referees, NOT the CV owner — never include a reference/referee's email in the owner's "emails" field, even though it appears in the same document. Only extract emails that are presented as the CV owner's own contact details (typically in the header, contact section, or personal profile section).
+15. Extract all phone numbers belonging to the CV OWNER only, with the same exclusion of reference/referee phone numbers as rule 14. Additionally, if the same phone number appears more than once in the document written in different formats (e.g., "+91-9014516726" and "9014516726" — the same digits with/without a country code or punctuation), include it only ONCE in the phones array, using the more complete formatted version (the one with the country code, if given). Do not list the same underlying number twice just because it was typed differently in two places.
 16. Choose the latest organization as current organization.
 17. Choose the latest designation as current designation.
 18. If publication type is unclear classify using:
@@ -547,6 +548,45 @@ class ResumeAnalyzerEngine:
             _report(f"OCR failed: {e}")
 
         return text.strip()
+
+    def extract_text_from_docx(self, docx_path: str, progress_callback=None) -> str:
+        """Extract text from a DOCX file by reading paragraphs and table cells."""
+        def _report(msg):
+            logger.info(msg)
+            if progress_callback:
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass
+
+        text_parts = []
+        try:
+            document = docx.Document(docx_path)
+            _report("Opened DOCX document. Extracting paragraphs and tables...")
+
+            for i, para in enumerate(document.paragraphs, start=1):
+                if para.text and para.text.strip():
+                    text_parts.append(para.text.strip())
+                if i % 20 == 0:
+                    _report(f"DOCX extraction: processed {i} paragraphs...")
+
+            for table_index, table in enumerate(document.tables, start=1):
+                _report(f"DOCX extraction: processing table {table_index}/{len(document.tables)}...")
+                for row in table.rows:
+                    row_text = " \t ".join(cell.text.strip() for cell in row.cells if cell.text and cell.text.strip())
+                    if row_text:
+                        text_parts.append(row_text)
+
+            extracted_text = "\n".join(text_parts).strip()
+            if extracted_text:
+                _report("DOCX text extraction succeeded.")
+            else:
+                _report("DOCX text extraction produced no readable text.")
+            return extracted_text
+        except Exception as e:
+            logger.error(f"DOCX text extraction failed: {e}")
+            _report(f"DOCX extraction failed: {e}")
+            return ""
 
     @staticmethod
     def _clean_json_text(raw_text: str) -> str:

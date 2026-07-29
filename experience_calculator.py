@@ -289,6 +289,39 @@ def _normalize_award_text(text: str) -> str:
     return " ".join(words)
 
 
+def _normalize_phone(phone: str) -> str:
+    """Strip everything except digits, then drop a leading country/trunk code
+    variance by keeping only the last 10 digits — this is the part that
+    genuinely identifies the number; country code presence/absence or a
+    leading 0 is just formatting, not a different phone number."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def dedupe_phones(phones: list) -> list:
+    """Remove duplicate phone entries where the same underlying number was
+    written twice in different formats (e.g. '+91-9014516726' and
+    '9014516726'). Keeps the longer/more complete-looking formatted string
+    for each unique underlying number."""
+    if not phones:
+        return phones
+    seen = {}
+    order = []
+    for phone in phones:
+        phone_str = phone if isinstance(phone, str) else str(phone)
+        if not phone_str.strip():
+            continue
+        key = _normalize_phone(phone_str)
+        if not key:
+            continue
+        if key not in seen:
+            seen[key] = phone_str
+            order.append(key)
+        elif len(phone_str) > len(seen[key]):
+            seen[key] = phone_str
+    return [seen[k] for k in order]
+
+
 def dedupe_awards(awards: list) -> list:
     """Remove near-duplicate award entries that describe the same underlying
     award with slightly different wording (e.g. two lines both describing an
@@ -383,6 +416,10 @@ def safe_process_record(record: dict, publications: list) -> dict:
         record = normalize_education(record)
     except Exception as e:
         logger.error(f"Education normalization failed for {record.get('source_file')}: {e}")
+    try:
+        record["phones"] = dedupe_phones(record.get("phones") or [])
+    except Exception as e:
+        logger.error(f"Phone dedup failed for {record.get('source_file')}: {e}")
     try:
         # Debugging aid: log raw designation_history before experience calc.
         # This is intentionally lightweight and does NOT make any external calls.
