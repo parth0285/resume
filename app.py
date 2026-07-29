@@ -18,6 +18,10 @@ from export_utils import (
 # Load environment variables
 load_dotenv()
 
+# Bridge Streamlit Cloud secrets into environment variables
+if "GOOGLE_STUDIO_API_KEY" in st.secrets:
+    os.environ["GOOGLE_STUDIO_API_KEY"] = st.secrets["GOOGLE_STUDIO_API_KEY"]
+
 # Set page config for a clean SaaS look
 st.set_page_config(
     page_title="Resume Extraction Engine",
